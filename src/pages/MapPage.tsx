@@ -96,6 +96,48 @@ function getBaseStyle(): string | StyleSpecification {
   return buildOSMStyle();
 }
 
+/* ----------------------- صور Google Satellite الرسمية ----------------------- */
+/*
+ * يتطلب Google Maps Platform -> Map Tiles API ومفتاحًا مقيدًا للخدمة والدومين.
+ * Render (Vite): VITE_GOOGLE_MAP_TILES_API_KEY
+ * لا نستخدم عناوين صور Google غير الرسمية.
+ */
+type BaseLayer = "streets" | "satellite";
+type GoogleTileSession = { session: string; expiry: number; tileWidth: number };
+
+const GOOGLE_SOURCE_ID = "google-satellite-src";
+const GOOGLE_LAYER_ID = "google-satellite-raster";
+
+function getGoogleTilesKey(): string | undefined {
+  const fromVite =
+    (import.meta as any)?.env?.VITE_GOOGLE_MAP_TILES_API_KEY ??
+    (import.meta as any)?.env?.VITE_GOOGLE_MAPS_API_KEY;
+  const key = typeof fromVite === "string" ? fromVite.trim() : "";
+  return key || undefined;
+}
+
+async function createGoogleTileSession(key: string): Promise<GoogleTileSession> {
+  const response = await fetch(
+    `https://tile.googleapis.com/v1/createSession?key=${encodeURIComponent(key)}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mapType: "satellite", language: "ar-SA", region: "SA" }),
+    },
+  );
+  if (!response.ok) throw new Error(`Google Map Tiles API HTTP ${response.status}`);
+  const result = await response.json();
+  if (typeof result?.session !== "string" || !result.session) {
+    throw new Error("Google Map Tiles API did not return a session token");
+  }
+  const expiry = Number(result.expiry);
+  return {
+    session: result.session,
+    expiry: Number.isFinite(expiry) && expiry > 0 ? expiry : Math.floor(Date.now() / 1000) + 3600,
+    tileWidth: Number(result.tileWidth) || 256,
+  };
+}
+
 /* ----------------------- اختيار ميوتاشن الحفظ المتاحة ----------------------- */
 function pickUpsertMutation() {
   const anyTrpc = trpc as any;
@@ -130,6 +172,149 @@ export default function MapPage() {
   const [strokeEnabled, setStrokeEnabled] = useState(true);
   const [radiusM, setRadiusM] = useState(60);
 
+  // الطبقة العادية تبقى كما هي؛ Google تُضاف أعلى الخلفية وأسفل نقاط المواقع.
+  const googleTilesKey = useMemo(() => getGoogleTilesKey(), []);
+  const initialLayer: BaseLayer = googleTilesKey ? "satellite" : "streets";
+  const [baseLayer, setBaseLayer] = useState<BaseLayer>(initialLayer);
+  const [satelliteBusy, setSatelliteBusy] = useState(false);
+  const [satelliteError, setSatelliteError] = useState<string | null>(null);
+  const [googleCopyright, setGoogleCopyright] = useState("");
+  const baseLayerRef = useRef<BaseLayer>(initialLayer);
+  const googleSessionRef = useRef<GoogleTileSession | null>(null);
+  const satelliteLoadingRef = useRef(false);
+  const attributionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const attributionAbortRef = useRef<AbortController | null>(null);
+
+  // يُحدَّث نص الحقوق بحسب النطاق الظاهر؛ Google تشترط إظهار حقوق مقدمي الصور.
+  async function refreshGoogleCopyright(map: Map, session: string) {
+    if (!googleTilesKey || baseLayerRef.current !== "satellite") return;
+    attributionAbortRef.current?.abort();
+    const controller = new AbortController();
+    attributionAbortRef.current = controller;
+    const bounds = map.getBounds();
+    const params = new URLSearchParams({
+      key: googleTilesKey,
+      session,
+      zoom: String(Math.floor(map.getZoom())),
+      north: String(bounds.getNorth()),
+      south: String(bounds.getSouth()),
+      east: String(bounds.getEast()),
+      west: String(bounds.getWest()),
+    });
+    try {
+      const response = await fetch(`https://tile.googleapis.com/tile/v1/viewport?${params}`, {
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`Google viewport HTTP ${response.status}`);
+      const info = await response.json();
+      if (!controller.signal.aborted && mapRef.current === map && baseLayerRef.current === "satellite") {
+        setGoogleCopyright(typeof info.copyright === "string" ? info.copyright : "");
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        console.error("[Google Satellite] attribution:", error);
+        setSatelliteError("تعذر جلب حقوق صور Google للمنطقة الحالية؛ راجع إعدادات Map Tiles API.");
+      }
+    } finally {
+      if (attributionAbortRef.current === controller) attributionAbortRef.current = null;
+    }
+  }
+
+  function scheduleGoogleCopyright(map: Map) {
+    if (attributionTimerRef.current) clearTimeout(attributionTimerRef.current);
+    if (baseLayerRef.current !== "satellite" || !googleSessionRef.current) return;
+    const session = googleSessionRef.current.session;
+    attributionTimerRef.current = setTimeout(() => {
+      attributionTimerRef.current = null;
+      void refreshGoogleCopyright(map, session);
+    }, 250);
+  }
+
+  // لا نستخدم map.setStyle حتى لا تختفي الطبقات والرسومات الموجودة.
+  async function enableGoogleSatellite(map: Map) {
+    if (!googleTilesKey || satelliteLoadingRef.current) return;
+    const existingSession = googleSessionRef.current;
+    if (
+      existingSession &&
+      existingSession.expiry * 1000 > Date.now() + 60_000 &&
+      map.getLayer(GOOGLE_LAYER_ID)
+    ) {
+      map.setLayoutProperty(
+        GOOGLE_LAYER_ID,
+        "visibility",
+        baseLayerRef.current === "satellite" ? "visible" : "none",
+      );
+      scheduleGoogleCopyright(map);
+      return;
+    }
+
+    satelliteLoadingRef.current = true;
+    setSatelliteBusy(true);
+    setSatelliteError(null);
+    try {
+      const tileSession = await createGoogleTileSession(googleTilesKey);
+      if (mapRef.current !== map) return; // الصفحة أُغلقت أثناء الطلب
+      if (map.getLayer(GOOGLE_LAYER_ID)) map.removeLayer(GOOGLE_LAYER_ID);
+      if (map.getSource(GOOGLE_SOURCE_ID)) map.removeSource(GOOGLE_SOURCE_ID);
+
+      // البروتوكول الرسمي: Google Map Tiles API، وليس روابط mt0.google.com غير المدعومة.
+      const tiles = [
+        `https://tile.googleapis.com/v1/2dtiles/{z}/{x}/{y}?session=${encodeURIComponent(tileSession.session)}&key=${encodeURIComponent(googleTilesKey)}`,
+      ];
+      map.addSource(GOOGLE_SOURCE_ID, {
+        type: "raster",
+        tiles,
+        tileSize: tileSession.tileWidth,
+        maxzoom: 22,
+        attribution: "Google Maps",
+      });
+      map.addLayer(
+        {
+          id: GOOGLE_LAYER_ID,
+          type: "raster",
+          source: GOOGLE_SOURCE_ID,
+          layout: { visibility: baseLayerRef.current === "satellite" ? "visible" : "none" },
+        },
+        map.getLayer("locations-points") ? "locations-points" : undefined,
+      );
+      googleSessionRef.current = tileSession;
+      scheduleGoogleCopyright(map);
+    } catch (error) {
+      console.error("[Google Satellite]", error);
+      if (mapRef.current === map) {
+        setSatelliteError(
+          "تعذّر تشغيل صور Google. تحقق من مفتاح API، وتفعيل Map Tiles API والفوترة، وصلاحيات الدومين.",
+        );
+        // إظهار الخريطة العادية بدل شاشة فارغة؛ مع تنبيه واضح بعدم نجاح Google.
+        baseLayerRef.current = "streets";
+        setBaseLayer("streets");
+      }
+    } finally {
+      satelliteLoadingRef.current = false;
+      if (mapRef.current === map) setSatelliteBusy(false);
+    }
+  }
+
+  function changeBaseLayer(next: BaseLayer) {
+    const map = mapRef.current;
+    if (next === "satellite" && !googleTilesKey) {
+      setSatelliteError("أضف VITE_GOOGLE_MAP_TILES_API_KEY إلى Environment في Render ثم أعد نشر الموقع.");
+      return;
+    }
+    baseLayerRef.current = next;
+    setBaseLayer(next);
+    if (next === "streets") {
+      setGoogleCopyright("");
+      attributionAbortRef.current?.abort();
+      if (attributionTimerRef.current) clearTimeout(attributionTimerRef.current);
+      if (map?.getLayer(GOOGLE_LAYER_ID)) {
+        map.setLayoutProperty(GOOGLE_LAYER_ID, "visibility", "none");
+      }
+      return;
+    }
+    if (map) void enableGoogleSatellite(map);
+  }
+
   function metersToPixels(m: number, z: number) {
     const lat = DIRIYAH_CENTER[1];
     const mpp = (156543.03392 * Math.cos((lat * Math.PI) / 180)) / Math.pow(2, z);
@@ -155,7 +340,12 @@ export default function MapPage() {
       ],
     });
 
-    map.on("error", (e) => console.error("[maplibre]", e?.error || e));
+    map.on("error", (e) => {
+      console.error("[maplibre]", e?.error || e);
+      if ((e as any)?.sourceId === GOOGLE_SOURCE_ID) {
+        setSatelliteError("تعذر تحميل بعض صور Google؛ افحص صلاحيات API واتصال المتصفح.");
+      }
+    });
     mapRef.current = map;
 
     map.once("load", () => {
@@ -225,6 +415,17 @@ export default function MapPage() {
       map.addControl(new maplibregl.NavigationControl(), "top-left");
       map.fitBounds(DIRIYAH_BOUNDS, { padding: 40, duration: 0 });
       map.resize();
+      map.on("moveend", () => {
+        if (baseLayerRef.current === "satellite") {
+          // جدّد الجلسة عند انتهاء صلاحيتها دون إعادة بناء الخريطة.
+          if (googleSessionRef.current && googleSessionRef.current.expiry * 1000 <= Date.now() + 60_000) {
+            void enableGoogleSatellite(map);
+          } else {
+            scheduleGoogleCopyright(map);
+          }
+        }
+      });
+      if (googleTilesKey) void enableGoogleSatellite(map);
     });
 
     const ro = new ResizeObserver(() => map.resize());
@@ -232,8 +433,11 @@ export default function MapPage() {
 
     return () => {
       ro.disconnect();
+      attributionAbortRef.current?.abort();
+      if (attributionTimerRef.current) clearTimeout(attributionTimerRef.current);
       map.remove();
       mapRef.current = null;
+      readyRef.current = false;
     };
   }, []);
 
@@ -390,8 +594,30 @@ export default function MapPage() {
 
   return (
     <div className="map-page flex-layout">
-      <div className="map-left">
+      <div className="map-left" style={{ position: "relative" }}>
         <div ref={mapEl} className="map-canvas" />
+        {/* مطلوب لإظهار اسم Google ومصدر الصور وحقوق الأطراف الثالثة عند استخدام Satellite */}
+        {baseLayer === "satellite" && !satelliteBusy && (
+          <div
+            aria-label="إسناد صور القمر الصناعي"
+            style={{
+              position: "absolute",
+              bottom: 30,
+              right: 12,
+              zIndex: 10,
+              maxWidth: "75%",
+              background: "rgba(255,255,255,0.92)",
+              color: "#202124",
+              fontSize: 11,
+              padding: "3px 6px",
+              borderRadius: 3,
+              direction: "ltr",
+              pointerEvents: "none",
+            }}
+          >
+            Google Maps{googleCopyright ? ` · ${googleCopyright}` : ""}
+          </div>
+        )}
         <div className="map-toolbar">
           <Button onClick={handleNew} size="sm">
             <Plus className="mr-1 h-4 w-4" /> موقع جديد
@@ -404,6 +630,27 @@ export default function MapPage() {
           >
             <Crosshair className="mr-1 h-4 w-4" /> نطاق الدرعية
           </Button>
+          <Button
+            size="sm"
+            variant={baseLayer === "streets" ? "default" : "outline"}
+            onClick={() => changeBaseLayer("streets")}
+          >
+            الخريطة العادية
+          </Button>
+          <Button
+            size="sm"
+            variant={baseLayer === "satellite" ? "default" : "outline"}
+            onClick={() => changeBaseLayer("satellite")}
+            disabled={satelliteBusy}
+            title="صور القمر الصناعي الرسمية من Google Maps"
+          >
+            {satelliteBusy ? "جارٍ تحميل Google…" : "القمر الصناعي (Google)"}
+          </Button>
+          {satelliteError && (
+            <div role="alert" style={{ color: "#b91c1c", background: "#fff", padding: "4px 8px", fontSize: 12 }}>
+              {satelliteError}
+            </div>
+          )}
         </div>
       </div>
 
